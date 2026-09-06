@@ -74,6 +74,15 @@ class MatrixRTCReceiver:
         self._poll_task: Optional[asyncio.Task] = None
         self._running = False
 
+    @property
+    def room(self) -> Any:
+        """The connected LiveKit room, or None before ``connect`` / after ``close``.
+
+        The outbound publisher adds its track to *this* connection: a call is one room
+        membership with a microphone, not two.
+        """
+        return self._room
+
     # --- lifecycle ---
 
     async def connect(self, sfu_url: str, jwt: str) -> None:
