@@ -23,8 +23,8 @@ import logging
 from typing import Any, Awaitable, Callable, Optional
 
 from .segmenter import (
-    CHANNELS, SAMPLE_RATE, TurnSegmenter, _positive_float, _rtc_config, pcm_duration,
-    pcm_rms, transcribe_pcm)
+    CHANNELS, SAMPLE_RATE, SPEECH_RMS, TurnSegmenter, _positive_float, _rtc_config,
+    pcm_duration, pcm_rms, transcribe_pcm)
 
 logger = logging.getLogger(__name__)
 
@@ -41,11 +41,10 @@ FFI_DRAIN_DELAY = 0.5
 # the user cutting us off rather than our own voice coming back. Short enough to feel like an
 # interruption, long enough that a door or a keyboard does not stop a reply mid-word.
 BARGE_IN_DURATION = 0.3
-# RMS floor a frame must clear to count towards that. Silence and comfort noise sit near zero
-# and speech in the hundreds, so this is what stops a continuously-delivered stream of quiet
-# frames reading as a permanent interruption. Same value the CLI voice recorder calls silence
-# (``tools/voice_mode.SILENCE_RMS_THRESHOLD``); a live room is the thing that retunes it.
-BARGE_IN_RMS = 200
+# RMS floor a frame must clear to count towards that. It is the segmenter's own speech floor:
+# one definition of "somebody is talking" for both halves of the duplex, so a room quiet
+# enough to end a turn cannot simultaneously be loud enough to interrupt a reply.
+BARGE_IN_RMS = SPEECH_RMS
 
 
 def livekit_available() -> bool:

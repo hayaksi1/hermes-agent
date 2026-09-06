@@ -10,6 +10,14 @@ utterance, and anything under 0.5 s is noise. Only that logic is shared — none
 Discord's RTP/SSRC/DAVE machinery applies here, because LiveKit delivers decoded PCM
 already attributed to a participant identity.
 
+One thing does not port with those timers: **what silence looks like**. Discord sends RTP
+only while a user speaks, so "no frame for 1.5 s" is a real gap. A decoded WebRTC sink
+never stops — LiveKit hands us comfort noise for the whole call — so frame arrival says
+nothing, and taking it as speech means no turn ever ends and nothing is ever transcribed.
+``feed`` therefore gates on level (``SPEECH_RMS``): quiet frames are dropped and do not
+touch the clock, which turns the continuous stream back into the Discord shape the timers
+were written for.
+
 Audio arrives as 16 kHz mono s16 because ``receiver.py`` asks the LiveKit SDK for that
 rate (the wire is 48 kHz; the SDK's native resampler does the conversion). That is also
 what Whisper wants, so ``pcm_to_wav`` is a stdlib ``wave`` write with no ffmpeg in the
@@ -31,6 +39,11 @@ logger = logging.getLogger(__name__)
 # Ported verbatim from Discord's VoiceReceiver — same speech, same ears.
 SILENCE_THRESHOLD = 1.5     # seconds of silence -> end of utterance
 MIN_SPEECH_DURATION = 0.5   # minimum seconds to process (skip noise)
+# RMS a frame must clear to count as somebody talking. Silence and comfort noise sit near
+# zero, speech in the hundreds. Same floor the CLI voice recorder calls silence
+# (``tools/voice_mode.SILENCE_RMS_THRESHOLD``) and the barge-in gate reuses; a live room is
+# the thing that retunes it, which is what ``matrix.rtc.speech_rms`` is for.
+SPEECH_RMS = 200
 
 # What we ask LiveKit to deliver, and therefore what the buffers hold.
 SAMPLE_RATE = 16000
@@ -66,7 +79,8 @@ class TurnSegmenter:
 
     def __init__(self, sample_rate: int = SAMPLE_RATE, channels: int = CHANNELS,
                  silence_threshold: Optional[float] = None,
-                 min_speech_duration: Optional[float] = None):
+                 min_speech_duration: Optional[float] = None,
+                 speech_rms: Optional[float] = None):
         cfg = _rtc_config()
         self.sample_rate = sample_rate
         self.channels = channels
@@ -76,6 +90,8 @@ class TurnSegmenter:
         self.min_speech_duration = _positive_float(
             min_speech_duration if min_speech_duration is not None
             else cfg.get("min_speech_duration"), MIN_SPEECH_DURATION)
+        self.speech_rms = _positive_float(
+            speech_rms if speech_rms is not None else cfg.get("speech_rms"), SPEECH_RMS)
         self._lock = threading.Lock()
         self._buffers: dict[str, bytearray] = defaultdict(bytearray)
         self._last_frame_time: dict[str, float] = {}
@@ -83,8 +99,16 @@ class TurnSegmenter:
     # --- ingest ---
 
     def feed(self, identity: str, pcm: bytes, now: Optional[float] = None) -> None:
-        """Append decoded PCM for *identity*. *now* is injectable so tests need no clock."""
-        if not pcm:
+        """Append decoded PCM for *identity*, if anyone is actually talking in it.
+
+        Frames below ``speech_rms`` are dropped whole rather than buffered, and — the half
+        that matters — never refresh the silence clock. A stream that keeps delivering them
+        is a speaker who has stopped, which is exactly what ``check_silence`` is waiting
+        for. Dropping them also keeps the buffer's length equal to the *speech* in it, so
+        ``min_speech_duration`` still measures a cough rather than the hour of quiet after
+        it. *now* is injectable so tests need no clock.
+        """
+        if not pcm or pcm_rms(pcm) < self.speech_rms:
             return
         stamp = time.monotonic() if now is None else now
         with self._lock:
@@ -93,6 +117,14 @@ class TurnSegmenter:
 
     def _duration(self, buf) -> float:
         return pcm_duration(buf, self.sample_rate, self.channels)
+
+    def _release(self, identity: str, buf: bytearray) -> tuple[str, bytes]:
+        """Hand an utterance back, and say so at INFO — the live call's only breadcrumb
+        between "audio arrived" and "Whisper returned something"."""
+        pcm = bytes(buf)
+        logger.info("MatrixRTC: utterance from %s released, %.2fs rms=%.0f",
+                    identity, self._duration(pcm), pcm_rms(pcm))
+        return identity, pcm
 
     # --- release ---
 
@@ -107,7 +139,7 @@ class TurnSegmenter:
                 if silence < self.silence_threshold:
                     continue
                 if self._duration(buf) >= self.min_speech_duration:
-                    completed.append((identity, bytes(buf)))
+                    completed.append(self._release(identity, buf))
                     self._buffers[identity] = bytearray()
                     self._last_frame_time.pop(identity, None)
                 elif silence >= self.silence_threshold * 2:
@@ -124,7 +156,7 @@ class TurnSegmenter:
         with self._lock:
             for identity, buf in list(self._buffers.items()):
                 if self._duration(buf) >= self.min_speech_duration:
-                    completed.append((identity, bytes(buf)))
+                    completed.append(self._release(identity, buf))
                 self._buffers.pop(identity, None)
                 self._last_frame_time.pop(identity, None)
         return completed

@@ -13,8 +13,11 @@ Two behaviours of the JWT service that callers depend on:
 
 * The OpenID token is **single use** — mint a fresh one for every ``/sfu/get``.
 * ``/sfu/get`` validates neither room membership nor room existence. Joining the
-  media plane therefore needs no ``m.rtc.member`` state event; that event is what
-  makes the bot *visible* in a client's call UI, which is a separate concern.
+  media plane therefore needs no RTC membership state event — which is precisely why
+  the bot could be audible on the SFU and absent from Element's widget at the same
+  time. ``join.publish_call_membership`` writes that event, and needs the *service*
+  URL discovered in step 1 (the one clients dial), not the SFU websocket URL,
+  so the chain hands both back.
 
 No function here logs or returns a credential in a message. Tokens are passed by
 value and never formatted into an exception.
@@ -80,8 +83,8 @@ async def request_sfu_credentials(
 
 async def fetch_livekit_credentials(
         homeserver: str, user_id: str, access_token: str, room_id: str, device_id: str,
-        session=None, ssl: Optional[Any] = None) -> tuple[str, str]:
-    """Run the whole chain and return ``(sfu_websocket_url, livekit_jwt)``.
+        session=None, ssl: Optional[Any] = None) -> tuple[str, str, str]:
+    """Run the whole chain: ``(sfu_websocket_url, livekit_jwt, focus_service_url)``.
 
     Pass *session* to reuse the adapter's HTTP client. Otherwise one is created for the
     call; *ssl* is forwarded to its connector so a deployment behind a private CA can
@@ -102,4 +105,4 @@ async def _fetch(session, homeserver, user_id, access_token, room_id, device_id)
     sfu_url, jwt = await request_sfu_credentials(
         session, service_url, room_id, openid, device_id)
     logger.debug("MatrixRTC /sfu/get OK: url=%s jwt=<%d chars>", sfu_url, len(jwt))
-    return sfu_url, jwt
+    return sfu_url, jwt, service_url

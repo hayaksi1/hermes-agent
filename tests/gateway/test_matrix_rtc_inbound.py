@@ -6,6 +6,7 @@ drain delay) is asserted without native code.
 """
 
 import asyncio
+import logging
 import sys
 import types
 import wave
@@ -19,11 +20,26 @@ from plugins.platforms.matrix.rtc.focus import (
 
 RATE = seg.SAMPLE_RATE
 CHANNELS = seg.CHANNELS
+ALICE = "@alice:hs:AAA"
 
 
 def pcm(seconds: float) -> bytes:
-    """`seconds` of silence at the segmenter's native format (content is irrelevant)."""
-    return b"\x00\x01" * int(RATE * CHANNELS * seconds)
+    """`seconds` of speech-level audio at the segmenter's native format.
+
+    The level is what matters, not the waveform: anything below ``seg.SPEECH_RMS`` is
+    comfort noise to the segmenter and is never buffered, so audio a test means as speech
+    has to clear that floor. RMS 1024 here, five times over it.
+    """
+    return b"\x00\x04" * int(RATE * CHANNELS * seconds)
+
+
+def quiet(seconds: float) -> bytes:
+    """`seconds` of the comfort noise a decoded WebRTC sink delivers between utterances.
+
+    RMS 2. LiveKit hands us these continuously for the whole call — which is why frame
+    arrival cannot be what tells the segmenter someone is talking.
+    """
+    return b"\x02\x00" * int(RATE * CHANNELS * seconds)
 
 
 # --------------------------------------------------------------------------- segmenter
@@ -121,6 +137,79 @@ class TestTurnSegmentation:
         # 0.5s at 16 kHz is only ~0.167s at 48 kHz — below the minimum, so not speech.
         fast.feed("@alice:hs:AAA", pcm(0.5), now=0.0)
         assert fast.check_silence(now=2.0) == []
+
+
+class TestVoiceActivityDetection:
+    """A LiveKit stream never stops, so a frame arriving cannot mean someone is talking.
+
+    Discord's receiver gets RTP only while a user speaks, which is why the ported timers
+    could take frame arrival as speech. A decoded WebRTC sink delivers comfort noise for
+    the whole call instead, so ``check_silence`` never saw a gap and no turn ever ended:
+    the bot heard everything and answered nothing.
+    """
+
+    def test_a_turn_ends_while_the_stream_keeps_delivering_frames(self):
+        """The production bug, in one test: silence is a level, not an absence of frames."""
+        s = seg.TurnSegmenter()
+        s.feed(ALICE, pcm(1.0), now=0.0)
+        for tick in range(1, 21):  # 2 s of comfort noise, in the 100 ms the SDK ships
+            s.feed(ALICE, quiet(0.1), now=tick * 0.1)
+
+        released = s.check_silence(now=2.0)
+        assert [identity for identity, _ in released] == [ALICE]
+        assert len(released[0][1]) == len(pcm(1.0)), "the speech, not the silence after it"
+
+    def test_comfort_noise_alone_never_becomes_an_utterance(self):
+        s = seg.TurnSegmenter()
+        for tick in range(200):
+            s.feed(ALICE, quiet(0.1), now=tick * 0.1)
+
+        assert s.check_silence(now=1e6) == []
+        assert not s._buffers, "a silent stream must not even create a speaker"
+
+    def test_a_pause_inside_a_sentence_does_not_split_the_utterance(self):
+        s = seg.TurnSegmenter()
+        s.feed(ALICE, pcm(0.6), now=0.0)
+        s.feed(ALICE, quiet(0.5), now=0.6)
+        s.feed(ALICE, pcm(0.6), now=1.1)
+
+        released = s.check_silence(now=1.1 + s.silence_threshold)
+        assert len(released) == 1
+        assert len(released[0][1]) == len(pcm(1.2)), "one turn, and none of the pause in it"
+
+    def test_quiet_frames_do_not_hold_a_sub_minimum_buffer_open(self):
+        """Otherwise every cough leaves an entry alive for the length of the call."""
+        s = seg.TurnSegmenter()
+        s.feed(ALICE, pcm(0.1), now=0.0)
+        for tick in range(1, 61):
+            s.feed(ALICE, quiet(0.1), now=tick * 0.1)
+
+        assert s.check_silence(now=6.0) == []
+        assert not s._buffers
+
+    def test_the_floor_comes_from_config_yaml_not_the_environment(self):
+        with patch.object(seg, "_rtc_config", return_value={"speech_rms": 10_000}):
+            s = seg.TurnSegmenter()
+        assert s.speech_rms == 10_000
+
+        s.feed(ALICE, pcm(1.0), now=0.0)
+        assert s.check_silence(now=1e9) == [], "a floor that high hears nothing as speech"
+
+    @pytest.mark.parametrize("bad", [0, -1, "loud", None])
+    def test_an_unusable_floor_falls_back_to_the_default(self, bad):
+        """A floor of zero is the bug this whole class is about — never accept one."""
+        with patch.object(seg, "_rtc_config", return_value={"speech_rms": bad}):
+            assert seg.TurnSegmenter().speech_rms == seg.SPEECH_RMS
+
+    def test_a_released_utterance_is_logged_with_its_duration_and_level(self, caplog):
+        """The next live call has to be diagnosable from gateway.log alone."""
+        s = seg.TurnSegmenter()
+        s.feed(ALICE, pcm(1.0), now=0.0)
+        with caplog.at_level(logging.INFO, logger=seg.__name__):
+            s.check_silence(now=1e9)
+
+        line, = [r.getMessage() for r in caplog.records if "utterance" in r.getMessage()]
+        assert "1.00s" in line and "1024" in line and ALICE in line
 
 
 # ------------------------------------------------------------------------ pcm -> wav
@@ -250,16 +339,18 @@ class TestFocusDiscovery:
 
 class TestJwtExchange:
     @pytest.mark.asyncio
-    async def test_full_chain_returns_the_sfu_url_and_jwt(self):
+    async def test_full_chain_returns_the_sfu_url_the_jwt_and_the_focus(self):
         session = _FakeSession(
             get=[WELL_KNOWN_OK],
             post=[(200, {"access_token": "oid", "matrix_server_name": "hs"}),
                   (200, {"url": "wss://call.hs/livekit/sfu", "jwt": "j.w.t"})])
 
-        url, jwt = await fetch_livekit_credentials(
+        url, jwt, focus = await fetch_livekit_credentials(
             "https://hs", "@bot:hs", "tok", "!room:hs", "DEVICE1", session=session)
 
         assert (url, jwt) == ("wss://call.hs/livekit/sfu", "j.w.t")
+        assert focus == "https://call.hs/livekit/jwt", \
+            "the JWT service, not the SFU: it is what our own call membership advertises"
         sfu_url, sfu_kwargs = session.posts[-1]
         assert sfu_url == "https://call.hs/livekit/jwt/sfu/get"
         assert sfu_kwargs["json"] == {

@@ -578,7 +578,7 @@ def rtc(monkeypatch):
     _FakeReceiver.instances = []
 
     async def fake_credentials(*a, **kw):
-        return "wss://sfu.hs.tld", "jwt-token"
+        return "wss://sfu.hs.tld", "jwt-token", "https://call.hs.tld/livekit/jwt"
 
     monkeypatch.setattr(jn, "MatrixRTCReceiver", _FakeReceiver)
     monkeypatch.setattr(jn, "fetch_livekit_credentials", fake_credentials)

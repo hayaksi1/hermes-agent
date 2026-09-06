@@ -6,6 +6,8 @@ SDK, opens a socket or talks to a homeserver. The gateway half runs the *real*
 is that those methods stopped being Discord-only.
 """
 
+from urllib.parse import quote
+
 import pytest
 
 from gateway.config import Platform
@@ -15,12 +17,14 @@ from gateway.session import SessionSource
 from plugins.platforms.matrix.rtc import join as jn
 from plugins.platforms.matrix.rtc import outbound as ob
 from plugins.platforms.matrix.rtc.join import (
-    MatrixCall, MatrixRTCVoiceMixin, live_call_members, membership_user_id)
+    CALL_MEMBER_TYPE, MatrixCall, MatrixRTCVoiceMixin, call_membership_content,
+    live_call_members, membership_user_id)
 
 ROOM = "!voice:hs.tld"
 ALICE, BOT = "@alice:hs.tld", "@hermes:hs.tld"
 ALICE_ID, MALLORY_ID = f"{ALICE}:DEVICEAAA", "@mallory:hs.tld:DEVICEZZZ"
 NOW_MS = 1_757_000_000_000
+FOCUS_URL = "https://call.hs.tld/livekit/jwt"
 
 # Verbatim off a live Element Desktop 1.12.27 call, 2026-09-06. The state key is the
 # percent-decoded path segment Synapse logged; the content is the MSC3401 membership that
@@ -72,6 +76,25 @@ class _FakeReceiver:
         self.closed = True
         if self.flush_on_close is not None:  # the utterance still in the segmenter
             await self.on_transcript(*self.flush_on_close)
+
+
+class _FakeApi:
+    """``client.api``: records raw requests. RTC membership is an unmodelled event type, so
+    the mixin has to reach for the raw API and so does its double."""
+
+    def __init__(self, fail: bool = False):
+        self.calls, self.fail = [], fail
+
+    async def request(self, method, path, content=None, **kw):
+        self.calls.append((str(method), path, content))
+        if self.fail:
+            raise RuntimeError("M_FORBIDDEN: you don't have permission to post that event")
+        return {"event_id": "$evt"}
+
+
+class _FakeClient:
+    def __init__(self, device_id="DEVICEBOT", api=None):
+        self.device_id, self.api = device_id, api or _FakeApi()
 
 
 class _FakeParticipant:
@@ -151,7 +174,7 @@ def rtc(monkeypatch):
         credentials["calls"].append(
             {"homeserver": homeserver, "user_id": user_id, "room_id": room_id,
              "device_id": device_id, "session": kw.get("session")})
-        return "wss://sfu.hs.tld", "jwt-token"
+        return "wss://sfu.hs.tld", "jwt-token", FOCUS_URL
 
     monkeypatch.setattr(jn, "MatrixRTCReceiver", _FakeReceiver)
     monkeypatch.setattr(jn, "fetch_livekit_credentials", fake_credentials)
@@ -379,6 +402,94 @@ class TestVoiceChannelInfo:
 
     def test_a_room_with_no_call_reports_nothing(self):
         assert _Adapter().get_voice_channel_info(ROOM) is None
+
+
+# ------------------------------------------------------------------ publishing our own
+
+
+def with_api(adapter=None, fail=False, device="DEVICEBOT") -> _Adapter:
+    """An adapter whose homeserver requests can be inspected."""
+    adapter = adapter or _Adapter()
+    adapter._client = _FakeClient(device, _FakeApi(fail=fail))
+    return adapter
+
+
+def state_path(state_key: str) -> str:
+    return (f"/_matrix/client/v3/rooms/{quote(ROOM, safe='')}"
+            f"/state/{CALL_MEMBER_TYPE}/{quote(state_key, safe='')}")
+
+
+class TestCallMembershipContent:
+    """The SFU is not the call UI. ``/sfu/get`` checks neither membership nor the room, so
+    the bot can be audible to everyone and still absent from Element's widget — which is
+    exactly what happened live. This state event is the only thing that closes that gap."""
+
+    def test_the_content_carries_the_keys_element_actually_publishes(self):
+        """Against the captured event, not a guess: matrix-js-sdk drops a membership that
+        is missing any of application / call_id / device_id / focus_active / foci_preferred,
+        and a dropped membership is an invisible bot."""
+        content = call_membership_content(ROOM, "DEVICEBOT", FOCUS_URL)
+
+        assert set(content) == set(ELEMENT_CONTENT)
+        assert (content["application"], content["scope"]) == ("m.call", "m.room")
+        assert content["call_id"] == "", "the room's own call, not a named one"
+        assert content["device_id"] == "DEVICEBOT"
+        assert content["focus_active"] == ELEMENT_CONTENT["focus_active"]
+        assert content["foci_preferred"] == [
+            {"type": "livekit", "livekit_alias": ROOM, "livekit_service_url": FOCUS_URL}]
+
+    def test_the_membership_we_publish_reads_back_as_live(self):
+        """The round trip that matters: another Hermes asking who is on this call has to
+        see us, so the writer and ``live_call_members`` cannot drift apart."""
+        event = {"type": CALL_MEMBER_TYPE, "state_key": f"_{BOT}_DEVICEBOT_m.call",
+                 "content": call_membership_content(ROOM, "DEVICEBOT", FOCUS_URL)}
+        assert live_call_members([event], NOW_MS) == {BOT}
+
+
+class TestCallMembershipPublishing:
+    @pytest.mark.asyncio
+    async def test_joining_publishes_the_membership_under_our_own_device(self, rtc):
+        adapter = await joined(with_api())
+
+        (method, path, content), = adapter._client.api.calls
+        assert method == "PUT"
+        assert path == state_path(f"_{BOT}_DEVICEBOT_m.call")
+        assert content == call_membership_content(ROOM, "DEVICEBOT", FOCUS_URL)
+
+    @pytest.mark.asyncio
+    async def test_the_state_key_is_the_shape_element_writes(self, rtc):
+        """``_@user:hs_DEVICE_m.call`` — and our own parser has to survive the round trip."""
+        adapter = await joined(with_api())
+
+        state_key = quote(f"_{BOT}_DEVICEBOT_m.call", safe="")
+        assert adapter._client.api.calls[0][1].endswith(state_key)
+        assert membership_user_id(f"_{BOT}_DEVICEBOT_m.call") == BOT
+
+    @pytest.mark.asyncio
+    async def test_leaving_clears_the_membership_with_empty_content(self, rtc):
+        """Leaving a call is published as empty content, never a redaction."""
+        adapter = await joined(with_api())
+        await adapter.leave_voice_channel(ROOM)
+
+        join_call, leave_call = adapter._client.api.calls
+        assert leave_call[2] == {}
+        assert leave_call[1] == join_call[1], "a different state key leaves a ghost behind"
+
+    @pytest.mark.asyncio
+    async def test_a_rejected_membership_does_not_take_the_call_down(self, rtc):
+        """The audio is already up. A widget listing is not worth hanging up over."""
+        adapter = with_api(fail=True)
+        assert await adapter.join_voice_channel(MatrixCall(ROOM, "Voice Room")) is True
+        assert ROOM in adapter.rtc_receivers and adapter.is_in_voice_channel(ROOM)
+
+        await adapter.leave_voice_channel(ROOM)
+        assert adapter.rtc_receivers == {}
+
+    @pytest.mark.asyncio
+    async def test_an_adapter_with_no_client_still_joins(self, rtc):
+        """``_client`` is None on object.__new__ instances and in most of this file."""
+        adapter = await joined()
+        assert adapter.is_in_voice_channel(ROOM)
 
 
 # --------------------------------------------------------------------------- gateway

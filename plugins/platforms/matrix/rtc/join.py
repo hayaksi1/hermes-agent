@@ -17,6 +17,14 @@ Membership state is read defensively on purpose. Two event types and two content
 in the wild depending on which client started the call, so ``live_call_members`` accepts all
 of them and reads "no expiry stated" as live: refusing to join a call that is plainly
 running, because a field we guessed at is missing, is the worse failure.
+
+Writing it is the opposite: exactly one shape, copied off a live Element Desktop 1.12.27
+call. matrix-js-sdk silently drops a membership missing any of ``application`` / ``call_id``
+/ ``device_id`` / ``focus_active`` / ``foci_preferred``, and a dropped membership is a bot
+nobody can see in the call — which is what the SFU-only join looked like in production.
+Media and signalling are independent here (``/sfu/get`` checks neither room membership nor
+room existence), so the state event is the only thing that puts the bot in the widget, and a
+homeserver refusing it is never a reason to hang up on a call that is already audible.
 """
 
 from __future__ import annotations
@@ -39,6 +47,15 @@ logger = logging.getLogger(__name__)
 # MSC4143's type and the MSC3401 name Element shipped first. Which one a room carries
 # depends on the client that started the call, so both count.
 RTC_MEMBER_TYPES = frozenset({"m.rtc.member", "org.matrix.msc3401.call.member"})
+
+# What we *write*. Element Desktop 1.12.27 publishes the MSC3401 name and nothing else, and
+# a client that reads both would list the bot twice if we sent both — so we send what the
+# client in the room actually sends, and keep reading both.
+CALL_MEMBER_TYPE = "org.matrix.msc3401.call.member"
+
+# Element's own value. There is no ``created_ts``: matrix-js-sdk falls back to the event's
+# ``origin_server_ts``, which the homeserver stamps and we cannot lie about.
+MEMBERSHIP_EXPIRY_MS = 14_400_000  # 4 hours
 
 
 @dataclass
@@ -107,6 +124,26 @@ def live_call_members(state_events, now_ms: Optional[float] = None) -> set[str]:
     return live
 
 
+def call_membership_content(room_id: str, device_id: str, service_url: str) -> dict:
+    """Our own RTC membership, in the shape a live Element call publishes it.
+
+    Every key is load-bearing: matrix-js-sdk validates the five of them and ignores a
+    membership that is missing one, so a guessed-at schema shows up as a bot that joined
+    the SFU and appears in nobody's call UI. ``foci_preferred`` advertises the JWT service
+    URL — the one clients POST ``/sfu/get`` to, not the SFU websocket we connected on.
+    """
+    return {
+        "application": "m.call",
+        "call_id": "",  # the room's own call
+        "device_id": device_id,
+        "expires": MEMBERSHIP_EXPIRY_MS,
+        "focus_active": {"type": "livekit", "focus_selection": "oldest_membership"},
+        "foci_preferred": [{"type": "livekit", "livekit_alias": room_id,
+                            "livekit_service_url": service_url}],
+        "scope": "m.room",
+    }
+
+
 class MatrixRTCVoiceMixin:
     """Joining half of a MatrixRTC call. Mixed into ``MatrixAdapter``."""
 
@@ -155,7 +192,7 @@ class MatrixRTCVoiceMixin:
         if room_id in self.rtc_receivers:
             return True
         try:
-            sfu_url, jwt = await fetch_livekit_credentials(
+            sfu_url, jwt, focus_url = await fetch_livekit_credentials(
                 self._homeserver, self._user_id, self._access_token, room_id,
                 self._rtc_device_id(), session=self._rtc_http_session())
             receiver = MatrixRTCReceiver(
@@ -179,18 +216,23 @@ class MatrixRTCVoiceMixin:
             # Half a call beats no call: we still hear the user, and play_tts falls back to
             # sending the reply as a voice message.
             logger.warning("MatrixRTC: joined %s without an outbound track: %s", room_id, exc)
+        await self._publish_call_membership(
+            room_id, call_membership_content(room_id, self._rtc_device_id(), focus_url))
         return True
 
     async def leave_voice_channel(self, room_id: str) -> None:
-        """Stop speaking, stop listening, unbind.
+        """Stop speaking, stop listening, unbind, and take ourselves out of the call UI.
 
         The order is load-bearing: ``close()`` flushes the utterance still sitting in the
-        segmenter, and that transcript needs the bind to reach a session.
+        segmenter, and that transcript needs the bind to reach a session. Clearing the
+        membership goes last for the same reason it goes last on join — the state event
+        describes what the media plane is already doing.
         """
         await self.stop_rtc_audio(room_id)
         if (receiver := self.rtc_receivers.pop(room_id, None)) is not None:
             await receiver.close()
         self.rtc_sessions.unbind(room_id)
+        await self._publish_call_membership(room_id, {})
 
     def get_voice_channel_info(self, room_id: str) -> Optional[Dict[str, Any]]:
         """``/voice status``: who else is on the call, or None when we are not in one.
@@ -241,6 +283,29 @@ class MatrixRTCVoiceMixin:
             logger.debug("MatrixRTC: could not read state of %s: %s", room_id, exc)
             return []
         return state if isinstance(state, list) else []
+
+    async def _publish_call_membership(self, room_id: str, content: dict) -> None:
+        """PUT our RTC membership for *room_id*; empty *content* is how leaving is said.
+
+        Raw ``api.request`` for the same reason the state read is raw: mautrix models
+        neither event type, so the typed client cannot send this one. Never raises — the
+        call is already up (or already down) by the time we get here, and a homeserver that
+        refuses the state event costs a widget entry, not the conversation.
+        """
+        api = getattr(getattr(self, "_client", None), "api", None)
+        if api is None:
+            return
+        state_key = f"_{self._user_id}_{self._rtc_device_id()}_m.call"
+        try:
+            from mautrix.api import Method
+            await api.request(
+                Method.PUT,
+                f"/_matrix/client/v3/rooms/{quote(room_id, safe='')}"
+                f"/state/{CALL_MEMBER_TYPE}/{quote(state_key, safe='')}",
+                content=content)
+        except Exception as exc:
+            logger.warning("MatrixRTC: could not %s call membership in %s: %s",
+                           "clear" if not content else "publish", room_id, exc)
 
     async def _rtc_room_name(self, room_id: str) -> str:
         """The room's display name for the join confirmation; the id if it has none."""

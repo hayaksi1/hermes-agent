@@ -584,8 +584,8 @@ This needs a homeserver that advertises a LiveKit focus in `/.well-known/matrix/
 The LiveKit SDK installs on first `/voice join`.
 
 Transcripts land on the room's own session, so a spoken question and a typed follow-up share
-one conversation. Hermes does not publish an `m.rtc.member` state event, so it is heard on
-the call but is not drawn as a participant in the client's call UI.
+one conversation. Hermes publishes its own call membership state event on join and clears it
+on leave, so it is drawn as a participant in the client's call UI like anyone else.
 
 Full setup, commands, and the `matrix.rtc` tuning knobs: [Voice Mode](../features/voice-mode.md).
 

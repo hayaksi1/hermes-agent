@@ -464,9 +464,12 @@ TTS back into the call — with three Matrix-specific differences:
 - **Barge-in works.** While Hermes is speaking, its own voice is discarded rather than
   transcribed; speech loud enough and long enough to be a real interruption stops the reply
   instead.
-- **The bot is audible but invisible in the client's call UI.** Hermes does not publish an
-  `m.rtc.member` state event, so clients do not draw it as a participant. It is heard, and
-  `/voice status` lists everyone else on the call.
+- **Hermes appears in the call UI like any other participant.** On join it publishes an
+  `org.matrix.msc3401.call.member` state event for its own device — the same event Element
+  writes — and clears it on leave. `/voice status` lists everyone else on the call. If the
+  room's power levels require a moderator for that state event, the write is refused, the
+  call still works, and `gateway.log` carries a `could not publish call membership` warning
+  with the homeserver's error — raise the bot's power level to fix it.
 
 Access control is the same allowlist that governs text: audio from a user Hermes would not
 answer in the room is dropped before it reaches STT.
@@ -478,12 +481,15 @@ matrix:
   rtc:
     silence_threshold: 1.5     # seconds of silence that end an utterance
     min_speech_duration: 0.5   # shorter bursts are treated as noise
+    speech_rms: 200            # loudness (0-32767) a frame must clear to count as speech
     barge_in_duration: 0.3     # unbroken seconds of speech that interrupt a reply
-    barge_in_rms: 200          # loudness (0-32767) a frame must clear to count as speech
+    barge_in_rms: 200          # same floor, applied while Hermes is the one talking
 ```
 
-Defaults suit a normal room; raise `barge_in_rms` in a noisy one so background sound cannot
-cut a reply short.
+Defaults suit a normal room. `speech_rms` is the important one: a LiveKit call delivers
+audio frames continuously, comfort noise included, so silence is measured by *level*, not by
+frames stopping. Raise it in a noisy room — background sound above the floor holds a turn
+open and cuts replies short; lower it if quiet speakers are being missed.
 
 ---
 
