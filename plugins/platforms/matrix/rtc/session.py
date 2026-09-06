@@ -103,6 +103,32 @@ class MatrixRTCSessions:
             return bool(check(source))
         return bool(self._adapter._is_authorized_user(source.user_id))
 
+    # --- barge-in ---
+
+    async def barge_in(self, room_id: str, identity: str) -> None:
+        """*identity* talked over the bot: stop the reply and the turn generating it.
+
+        Everything this needs already exists one level up. Setting the session's interrupt
+        guard is what the runner's monitor loop turns into ``agent.interrupt()`` plus
+        ``StreamingTTSConsumer.abort("barge-in")``, and that abort comes straight back here as
+        ``abort_streaming_tts`` -> ``publisher.clear()``. Stopping only the audio would leave
+        the model still generating a reply nobody will hear.
+
+        Idempotent (the guard is an already-set ``Event`` the second time) and a no-op when no
+        turn is running. Unauthorized speakers cannot interrupt: the same allowlist that keeps
+        their words out of the session keeps them from cancelling someone else's turn.
+        """
+        user_id, _device = split_identity(identity)
+        source = self.source_for(room_id, user_id)
+        if source is None or not self.is_authorized(room_id, identity):
+            return
+        adapter = self._adapter
+        # The same key derivation the spoken turn itself uses — ``_event_session_key`` reads
+        # nothing but ``event.source``, and a key built any other way would not find the guard.
+        session_key = adapter._event_session_key(MessageEvent(text="", source=source))
+        logger.info("MatrixRTC: barge-in from %s in %s", user_id, room_id)
+        await adapter.interrupt_session_activity(session_key, room_id)
+
     # --- dispatch ---
 
     def _is_duplicate(self, room_id: str, user_id: str, transcript: str) -> bool:
@@ -135,8 +161,21 @@ class MatrixRTCSessions:
         source = self.source_for(room_id, user_id, display_name)
         if source is None:  # unbound between the check and here
             return
+        await self._echo_transcript(source, transcript)
         # Top-level user fields mirror source.* because downstream prompt code reads them,
         # exactly as the adapter's own _build_inbound_event does.
         await self._adapter.handle_message(MessageEvent(
             text=transcript, source=source, message_type=MessageType.VOICE,
             user_id=user_id, user_name=display_name))
+
+    async def _echo_transcript(self, source: SessionSource, transcript: str) -> None:
+        """Post what we heard back into the room when ``stt_echo_transcripts`` is on.
+
+        The runner's own helper, which needs nothing but ``adapter.send`` — so a spoken turn
+        gets the same 🎙️ line a Telegram voice note gets, and STT quality is checkable from
+        the room instead of the logs. No runner (adapter driven standalone): nothing is echoed.
+        """
+        runner = getattr(self._adapter, "gateway_runner", None)
+        echo = getattr(runner, "_echo_stt_transcripts", None)
+        if echo is not None and runner._should_echo_stt_transcripts():
+            await echo(self._adapter, source, [transcript])

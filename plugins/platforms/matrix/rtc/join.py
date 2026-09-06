@@ -155,7 +155,14 @@ class MatrixRTCVoiceMixin:
                 self._rtc_device_id(), session=self._rtc_http_session())
             receiver = MatrixRTCReceiver(
                 on_transcript=functools.partial(self.rtc_sessions.on_transcript, room_id),
-                is_authorized=functools.partial(self.rtc_sessions.is_authorized, room_id))
+                is_authorized=functools.partial(self.rtc_sessions.is_authorized, room_id),
+                # The two halves of the duplex have to know about each other for exactly one
+                # reason: what the bot says comes back to its own ears. While the publisher is
+                # playing, the receiver drops what it hears instead of transcribing the reply
+                # as if the user had said it — and speech loud enough to survive that gate is
+                # the user cutting the reply off.
+                is_speaking=functools.partial(self.is_speaking_in, room_id),
+                on_barge_in=functools.partial(self.rtc_sessions.barge_in, room_id))
             await receiver.connect(sfu_url, jwt)
         except Exception:
             self.rtc_sessions.unbind(room_id)  # the gateway bound it before calling us

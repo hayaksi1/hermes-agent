@@ -19,8 +19,10 @@ path — unlike the Discord receiver, which must shell out to convert 48 kHz ste
 from __future__ import annotations
 
 import logging
+import math
 import threading
 import time
+from array import array
 from collections import defaultdict
 from typing import Optional
 
@@ -90,7 +92,7 @@ class TurnSegmenter:
             self._last_frame_time[identity] = stamp
 
     def _duration(self, buf) -> float:
-        return len(buf) / (self.sample_rate * self.channels * SAMPLE_WIDTH)
+        return pcm_duration(buf, self.sample_rate, self.channels)
 
     # --- release ---
 
@@ -131,6 +133,24 @@ class TurnSegmenter:
         with self._lock:
             self._buffers.clear()
             self._last_frame_time.clear()
+
+
+def pcm_duration(pcm, sample_rate: int = SAMPLE_RATE, channels: int = CHANNELS) -> float:
+    """Seconds of audio in a raw s16 buffer."""
+    return len(pcm) / (sample_rate * channels * SAMPLE_WIDTH)
+
+
+def pcm_rms(pcm: bytes) -> float:
+    """Level of a raw s16 frame, 0..32767. Silence is ~0; speech is hundreds.
+
+    Stdlib arithmetic because ``audioop`` was removed in 3.13 and numpy is not a dependency
+    of this path. ``array("h")`` reads native byte order, which is the little-endian s16 the
+    LiveKit SDK hands us and ``pcm_to_wav`` writes.
+    """
+    samples = array("h", bytes(pcm)[:len(pcm) - len(pcm) % SAMPLE_WIDTH])
+    if not samples:
+        return 0.0
+    return math.sqrt(sum(s * s for s in samples) / len(samples))
 
 
 def pcm_to_wav(pcm: bytes, output_path: str, sample_rate: int = SAMPLE_RATE,

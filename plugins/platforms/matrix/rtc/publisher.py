@@ -56,8 +56,13 @@ class MatrixRTCPublisher:
         self._track: Any = None
         self._publication: Any = None
         self._resampler: Any = None
+        self._speaking = False
 
     live = property(lambda self: self._source is not None)
+    # True from the first captured frame until the queue has played out or been dropped.
+    # Inbound audio in that window is our own voice coming back, so the receiver stops
+    # transcribing it; sustained speech through it is the user talking over us.
+    speaking = property(lambda self: self._source is not None and self._speaking)
 
     # --- lifecycle ---
 
@@ -82,6 +87,7 @@ class MatrixRTCPublisher:
         """Unpublish, drop the source, and let the FFI drain. Safe to call twice."""
         source, self._source = self._source, None
         self._resampler = self._track = None
+        self._speaking = False
         if self._publication is not None and (sid := getattr(self._publication, "sid", None)):
             try:
                 await self._room.local_participant.unpublish_track(sid)
@@ -133,9 +139,11 @@ class MatrixRTCPublisher:
         """
         if self._source is not None:
             await self._source.wait_for_playout()
+            self._speaking = False
 
     def clear(self) -> None:
         """Drop audio queued but not yet heard (abort / barge-in)."""
+        self._speaking = False
         if self._source is not None:
             self._source.clear_queue()
 
@@ -147,4 +155,5 @@ class MatrixRTCPublisher:
 
     async def _capture(self, frame: Any) -> None:
         if (source := self._source) is not None:
+            self._speaking = True
             await source.capture_frame(frame)

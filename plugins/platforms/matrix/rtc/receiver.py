@@ -1,8 +1,9 @@
 """LiveKit room lifecycle for MatrixRTC: join, subscribe, hear the user.
 
-Inbound half of the duplex only. Publishing TTS, mapping utterances onto a gateway
-session, and writing ``m.rtc.member`` so the bot shows up in a client's call UI are
-each their own concern and are not wired here.
+Inbound half of the duplex. Publishing TTS, mapping utterances onto a gateway session,
+and writing ``m.rtc.member`` so the bot shows up in a client's call UI are each their own
+concern and are not wired here — but *whether we are currently talking* is passed in, because
+a room hears what the bot says and the only sane place to drop that is before it is buffered.
 
 Two traps this module exists to encapsulate, both established against a live SFU:
 
@@ -21,7 +22,9 @@ import asyncio
 import logging
 from typing import Any, Awaitable, Callable, Optional
 
-from .segmenter import CHANNELS, SAMPLE_RATE, TurnSegmenter, transcribe_pcm
+from .segmenter import (
+    CHANNELS, SAMPLE_RATE, TurnSegmenter, _positive_float, _rtc_config, pcm_duration,
+    pcm_rms, transcribe_pcm)
 
 logger = logging.getLogger(__name__)
 
@@ -33,6 +36,16 @@ POLL_INTERVAL = 0.2
 
 # The FFI worker outlives disconnect() by a hair. See the module docstring.
 FFI_DRAIN_DELAY = 0.5
+
+# Barge-in: how much unbroken inbound speech, heard while we are the one talking, counts as
+# the user cutting us off rather than our own voice coming back. Short enough to feel like an
+# interruption, long enough that a door or a keyboard does not stop a reply mid-word.
+BARGE_IN_DURATION = 0.3
+# RMS floor a frame must clear to count towards that. Silence and comfort noise sit near zero
+# and speech in the hundreds, so this is what stops a continuously-delivered stream of quiet
+# frames reading as a permanent interruption. Same value the CLI voice recorder calls silence
+# (``tools/voice_mode.SILENCE_RMS_THRESHOLD``); a live room is the thing that retunes it.
+BARGE_IN_RMS = 200
 
 
 def livekit_available() -> bool:
@@ -58,17 +71,33 @@ class MatrixRTCReceiver:
     *is_authorized(identity)* is consulted once per utterance *before* transcription, so
     audio from a participant the operator never allowed is never sent to Whisper at all.
     Omitting it transcribes every speaker and leaves the allowlist entirely to the caller.
+
+    *is_speaking()* is the echo gate: while it is true the bot's own voice is in the room, so
+    inbound audio is discarded instead of buffered — otherwise the reply is transcribed back
+    as if the user had said it, and the bot answers itself. Speech that keeps coming through
+    that gate is the user talking over the reply, and calls *on_barge_in(identity)* once.
+    Without either callable the receiver behaves exactly as it did before: everything heard
+    is transcribed.
     """
 
     def __init__(self, on_transcript: Callable[[str, str], Awaitable[None]],
                  segmenter: Optional[TurnSegmenter] = None,
                  sample_rate: int = SAMPLE_RATE, channels: int = CHANNELS,
-                 is_authorized: Optional[Callable[[str], bool]] = None):
+                 is_authorized: Optional[Callable[[str], bool]] = None,
+                 is_speaking: Optional[Callable[[], bool]] = None,
+                 on_barge_in: Optional[Callable[[str], Awaitable[None]]] = None):
+        cfg = _rtc_config()
         self._on_transcript = on_transcript
         self._is_authorized = is_authorized
+        self._is_speaking = is_speaking
+        self._on_barge_in = on_barge_in
         self.sample_rate = sample_rate
         self.channels = channels
+        self.barge_in_duration = _positive_float(
+            cfg.get("barge_in_duration"), BARGE_IN_DURATION)
+        self.barge_in_rms = _positive_float(cfg.get("barge_in_rms"), BARGE_IN_RMS)
         self.segmenter = segmenter or TurnSegmenter(sample_rate, channels)
+        self._interrupting = 0.0  # unbroken seconds of speech heard while we talk
         self._room: Any = None
         self._tasks: set[asyncio.Task] = set()
         self._poll_task: Optional[asyncio.Task] = None
@@ -138,13 +167,41 @@ class MatrixRTCReceiver:
             track, sample_rate=self.sample_rate, num_channels=self.channels)
         try:
             async for event in stream:
-                self.segmenter.feed(identity, bytes(event.frame.data))
+                pcm = bytes(event.frame.data)
+                if self._is_speaking is not None and self._is_speaking():
+                    await self._hear_through_our_own_voice(identity, pcm)
+                    continue
+                self._interrupting = 0.0
+                self.segmenter.feed(identity, pcm)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
             logger.warning("MatrixRTC: audio stream for %s ended: %s", identity, exc)
         finally:
             await stream.aclose()
+
+    async def _hear_through_our_own_voice(self, identity: str, pcm: bytes) -> None:
+        """Handle one frame that arrived while we were speaking. The frame is never buffered.
+
+        Dropping it is the echo fix — whether it reached us off the user's speakers or straight
+        back off the SFU, it is our own reply, and transcribing it makes the bot answer itself.
+        Loud audio that keeps arriving anyway is the user interrupting, which is worth exactly
+        one callback: the reply it aborts is what closes this gate again.
+        """
+        if self._on_barge_in is None:
+            return
+        if pcm_rms(pcm) < self.barge_in_rms:
+            self._interrupting = 0.0  # a gap: whatever came before was not an interruption
+            return
+        was_below = self._interrupting < self.barge_in_duration
+        self._interrupting += pcm_duration(pcm, self.sample_rate, self.channels)
+        if not was_below or self._interrupting < self.barge_in_duration:
+            return
+        logger.info("MatrixRTC: %s spoke over us, interrupting", identity)
+        try:
+            await self._on_barge_in(identity)
+        except Exception:
+            logger.error("MatrixRTC: barge-in callback failed", exc_info=True)
 
     async def _poll_silence(self) -> None:
         try:

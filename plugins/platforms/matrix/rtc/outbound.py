@@ -96,6 +96,16 @@ class MatrixRTCOutboundMixin:
         publisher = self.rtc_publishers.get(room_id)
         return publisher is not None and publisher.live
 
+    def is_speaking_in(self, room_id: str) -> bool:
+        """True while our own voice is still playing in *room_id* — the echo window.
+
+        The receiver's gate, not a report about the humans on the call: Discord's
+        ``get_voice_channel_info`` puts an ``is_speaking`` flag on each *member*, which is a
+        different question and deliberately not what this answers.
+        """
+        publisher = self.rtc_publishers.get(room_id)
+        return publisher is not None and publisher.speaking
+
     # --- streaming TTS contract ---
 
     def supports_streaming_tts(self, chat_id: str, audio_format: AudioFormat) -> bool:
