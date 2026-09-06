@@ -457,7 +457,7 @@ reading the room's RTC membership state to find it.
 ### How It Works
 
 Same pipeline as Discord — silence-detected utterances, Whisper STT, the full agent turn,
-TTS back into the call — with three Matrix-specific differences:
+TTS back into the call — with four Matrix-specific differences:
 
 - **Transcripts land on the room's own session**, the same one the room's typed messages
   use, so a spoken question and a typed follow-up share one conversation.
@@ -470,6 +470,10 @@ TTS back into the call — with three Matrix-specific differences:
   room's power levels require a moderator for that state event, the write is refused, the
   call still works, and `gateway.log` carries a `could not publish call membership` warning
   with the homeserver's error — raise the bot's power level to fix it.
+- **`/voice leave` always works.** Restarting the gateway drops the audio connection but
+  not that state event, so Hermes is left in the call UI as a silent participant. Running
+  `/voice leave` in the room clears it, whether or not this gateway process was the one
+  that joined.
 
 Access control is the same allowlist that governs text: audio from a user Hermes would not
 answer in the room is dropped before it reaches STT.

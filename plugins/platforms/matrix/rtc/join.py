@@ -227,6 +227,11 @@ class MatrixRTCVoiceMixin:
         segmenter, and that transcript needs the bind to reach a session. Clearing the
         membership goes last for the same reason it goes last on join — the state event
         describes what the media plane is already doing.
+
+        Every step is unconditional, and the membership PUT especially so: the three
+        registries live in this process and the membership lives in the room, so after a
+        restart this runs with nothing to close and the state event is the only thing left
+        to clear. That is the case the ghost participant comes from, not the happy path.
         """
         await self.stop_rtc_audio(room_id)
         if (receiver := self.rtc_receivers.pop(room_id, None)) is not None:

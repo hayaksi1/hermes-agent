@@ -201,11 +201,21 @@ class GatewayVoiceMixin:
                 f"I'll speak my replies and listen to you. Use /voice leave to disconnect.")
 
     async def _handle_voice_channel_leave(self, event: MessageEvent) -> str:
+        """Hang up. A chat-scoped call is left whether or not we can still speak into it.
+
+        ``is_in_voice_channel`` answers "is there a live connection in *this process*",
+        which is the whole of a Discord call and only half of a MatrixRTC one: the
+        membership that puts the bot in the call UI is room state, and it outlives the
+        gateway. Guarding the leave on the in-memory half means a restart answers "Not in a
+        voice channel." while a muted ghost of the bot is still sitting in the call, with
+        nothing else in the system able to clear it. Idempotence is the adapter's job.
+        """
         adapter = self._adapter_for_source(event.source)
         scope_id = self._voice_scope_id(adapter, event)
+        chat_scoped = getattr(adapter, "voice_scope", "guild") == "chat"
         if not (scope_id and hasattr(adapter, "leave_voice_channel")
                 and hasattr(adapter, "is_in_voice_channel")
-                and adapter.is_in_voice_channel(scope_id)):
+                and (chat_scoped or adapter.is_in_voice_channel(scope_id))):
             return "Not in a voice channel."
         try:
             await adapter.leave_voice_channel(scope_id)
