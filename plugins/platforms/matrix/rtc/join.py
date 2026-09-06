@@ -56,15 +56,20 @@ class MatrixCall:
 def membership_user_id(state_key: str) -> str:
     """The Matrix user id inside an RTC membership state key.
 
-    Three shapes are in the wild: ``@u:hs`` (MSC3401 as first shipped), and the per-device
-    ``@u:hs_DEVICE`` / ``_@u:hs_DEVICE``. The split on the last underscore is only taken
-    when what precedes it still looks like a user id, so a localpart that contains one
-    (``@my_bot:hs``) is not cut in half — the same test ``split_identity`` applies to the
-    colon in a LiveKit identity.
+    The suffix count is not fixed: ``@u:hs`` (MSC3401 as first shipped), the per-device
+    ``@u:hs_DEVICE`` / ``_@u:hs_DEVICE``, and Element's ``_@u:hs_DEVICE_m.call``, which
+    appends the application too. So we cut at the *front* of the suffixes rather than
+    counting them off the end — the user id stops at the first underscore after the
+    server name, which cannot itself contain one (the grammar admits only a hostname,
+    an IP literal and a port). A localpart may, so the scan starts at the colon and
+    ``@my_bot:hs`` survives whole.
     """
     key = state_key[1:] if state_key.startswith("_") else state_key
-    user_id, sep, _device = key.rpartition("_")
-    return user_id if sep and user_id.startswith("@") and ":" in user_id else key
+    colon = key.find(":")
+    if not key.startswith("@") or colon < 0:
+        return key
+    cut = key.find("_", colon)
+    return key[:cut] if cut > 0 else key
 
 
 def _membership_live(entry: dict, now_ms: float) -> bool:

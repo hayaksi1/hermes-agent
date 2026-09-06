@@ -22,6 +22,23 @@ ALICE, BOT = "@alice:hs.tld", "@hermes:hs.tld"
 ALICE_ID, MALLORY_ID = f"{ALICE}:DEVICEAAA", "@mallory:hs.tld:DEVICEZZZ"
 NOW_MS = 1_757_000_000_000
 
+# Verbatim off a live Element Desktop 1.12.27 call, 2026-09-06. The state key is the
+# percent-decoded path segment Synapse logged; the content is the MSC3401 membership that
+# came with it, with the focus URL blanked (no tokens, no internal hostnames beyond the
+# user id the bug is about).
+ADMIN = "@admin:matrix.myhome.internal"
+ELEMENT_KEY = f"_{ADMIN}_EMNHZTXVIO_m.call"
+ELEMENT_CONTENT = {
+    "application": "m.call",
+    "call_id": "",
+    "device_id": "EMNHZTXVIO",
+    "expires": 14_400_000,
+    "focus_active": {"type": "livekit", "focus_selection": "oldest_membership"},
+    "foci_preferred": [{"type": "livekit", "livekit_alias": ROOM,
+                        "livekit_service_url": "https://livekit.example"}],
+    "scope": "m.room",
+}
+
 
 def rtc_member(user_id: str = ALICE, device: str = "DEVICEAAA", *,
                event_type: str = "m.rtc.member", content=None, state_key=None) -> dict:
@@ -169,6 +186,15 @@ class TestMembershipUserId:
     def test_that_localpart_still_gives_up_a_real_device_suffix(self):
         assert membership_user_id("@my_bot:hs.tld_DEVICEAAA") == "@my_bot:hs.tld"
 
+    def test_element_appends_the_application_after_the_device(self):
+        """The key Element Desktop 1.12.27 actually writes, verbatim off a live call:
+        ``PUT .../state/org.matrix.msc3401.call.member/_%40admin%3A..._EMNHZTXVIO_m.call``.
+        Two suffixes, not one — cutting only the last leaves the device on the user id."""
+        assert membership_user_id(ELEMENT_KEY) == ADMIN
+
+    def test_the_application_suffix_survives_an_underscore_in_the_localpart(self):
+        assert membership_user_id("@my_bot:hs.tld_DEVICEAAA_m.call") == "@my_bot:hs.tld"
+
 
 # --------------------------------------------------------------------------- memberships
 
@@ -211,6 +237,14 @@ class TestLiveCallMembers:
         events = [rtc_member(device="DEVICEAAA"), rtc_member(device="DEVICEBBB"),
                   rtc_member(user_id=BOT)]
         assert live_call_members(events, NOW_MS) == {ALICE, BOT}
+
+    def test_a_live_element_call_membership_is_read_off_the_wire_shape(self):
+        """Both halves of the production report at once: Element's three-part state key and
+        the MSC3401 content it ships with it. This is the call ``/voice join`` said nobody
+        was in."""
+        event = {"type": "org.matrix.msc3401.call.member", "state_key": ELEMENT_KEY,
+                 "content": ELEMENT_CONTENT}
+        assert live_call_members([event], NOW_MS) == {ADMIN}
 
 
 # --------------------------------------------------------------------------- join / leave
