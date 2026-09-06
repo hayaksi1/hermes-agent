@@ -54,12 +54,18 @@ class MatrixRTCReceiver:
     ``on_transcript(identity, transcript)`` is awaited on the receiver's own loop;
     ``identity`` is the LiveKit participant identity, which the Matrix JWT service
     derives as ``{matrix_user_id}:{device_id}``.
+
+    *is_authorized(identity)* is consulted once per utterance *before* transcription, so
+    audio from a participant the operator never allowed is never sent to Whisper at all.
+    Omitting it transcribes every speaker and leaves the allowlist entirely to the caller.
     """
 
     def __init__(self, on_transcript: Callable[[str, str], Awaitable[None]],
                  segmenter: Optional[TurnSegmenter] = None,
-                 sample_rate: int = SAMPLE_RATE, channels: int = CHANNELS):
+                 sample_rate: int = SAMPLE_RATE, channels: int = CHANNELS,
+                 is_authorized: Optional[Callable[[str], bool]] = None):
         self._on_transcript = on_transcript
+        self._is_authorized = is_authorized
         self.sample_rate = sample_rate
         self.channels = channels
         self.segmenter = segmenter or TurnSegmenter(sample_rate, channels)
@@ -143,6 +149,9 @@ class MatrixRTCReceiver:
 
     async def _emit(self, utterances) -> None:
         for identity, pcm in utterances:
+            if self._is_authorized is not None and not self._is_authorized(identity):
+                logger.info("MatrixRTC: discarding audio from %s before transcription", identity)
+                continue
             try:
                 transcript = await asyncio.to_thread(
                     transcribe_pcm, pcm, self.sample_rate, self.channels)
